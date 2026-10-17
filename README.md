@@ -1,88 +1,102 @@
 # RAG 幻觉治理与评测优化
 
-一组对照实验：**同一条生成链路，只改检索层与 Prompt，把编造率从 28% 降到 10%，Faithfulness 从 0.72 提到 0.89。**
+一个关于「**模型什么时候该闭嘴**」的小型对照实验。
 
-实验语料是 15 条床垫材料说明，测试集是 50 个人工设计的问题（对比类、适用人群类、保养类、极值类、场景类）。
+同一份语料（15 种床垫材料的说明文档）、同一批 50 个测试问题、同一条生成链路（`deepseek-chat`, `temperature 0.7`）、**完全相同的检索结果**，只把 Prompt 从「裸指令」换成「few-shot + 事实约束」，看模型行为怎么变。
+
+结论先说：**检索没变，回答从"编"变成了"拒答"。**
 
 ---
 
-## 1. 问题：单路向量检索 + 裸 Prompt，模型会编
+## 1. 实验设计（先看清楚变量）
 
-真实翻车例子：
+仓库里有两套 Prompt：
 
-> 用户问：「驼绒适合什么人」
-> 检索 top-3 里根本没有驼绒（向量检索把"适合什么人"的语义对到了新疆棉/马尾毛），
-> 模型照样答：「驼绒适合怕冷的人」—— **材料说明里没这句，这是编的。**
-
-拆开看是三处独立缺陷：
-
-1. **召回不全**：专有名词（驼绒、酷布9环）在向量空间里不占优势，单路向量检索会漏；
-2. **排序太粗**：即使召回对了，双塔模型给的相似度也无法精细判断"这段能不能回答这个问题"；
-3. **Prompt 没有退路**：没有 few-shot、没有"无依据就说没提及"的约束，模型就自由发挥。
-
-## 2. 实验设计
-
-| | 基线版 `rag_core_baseline.py` | 优化版 `rag_core_optimized.py` |
+| | `rag_core_baseline.py` | `rag_core_optimized.py` |
 |---|---|---|
-| 检索 | 向量检索 top-3 | BM25（top-50）+ 向量（top-50）→ **RRF 融合** → **Cross-Encoder 重排** top-5 |
-| Prompt | "根据以下材料回答问题" + 上下文 | 3 条 few-shot + 事实约束（"只能使用下面的材料说明，无依据时明确说材料库中未提及"） |
-| 上下文管理 | 无 | 滑动窗口 5 轮 + 超窗内容摘要压缩 |
-| 生成模型 | deepseek-chat, temperature 0.7 | 同左（**唯一变量只有检索与 Prompt**） |
+| 检索 | Sentence-Transformer 向量检索 top-3 | **同上**（同一套 `search()`） |
+| Prompt | `根据以下材料回答问题：{context}\n问题：{question}\n回答：` | 3 条 few-shot 示例 + 事实约束（「只能使用下面的材料说明，无依据时明确说"材料库中未提及"」）+ 上下文/对话历史管理 |
+| 生成模型与参数 | `deepseek-chat`, T=0.7 | 同左 |
 
-## 3. 结果
+**关键点：两版的检索结果逐题完全相同。** 这不是疏漏，而是本轮刻意只动一个变量 —— `rag_core_optimized.py` 里走的仍然是 `search()`（向量 top-3），混合检索模块 `hybrid_retriever.py` 在这轮评测里**没有接入**（详见第 5 节）。
 
-| 指标 | 基线版 | 优化版 |
-|---|---|---|
-| 50 题中编造回答 | 14 | 5 |
-| 幻觉率 | 28% | 10% |
-| Faithfulness（RAGAS，DeepSeek 作裁判） | 0.72 | 0.89 |
+所以下面的数字只能归因到 Prompt，不能归因到检索。
 
-逐题原始输出在 [`results_baseline.json`](results_baseline.json) / [`results_optimized.json`](results_optimized.json)，每条都带当次检索到的 `docs`，可以直接对照"检索错了"还是"生成错了"。
+## 2. 结果
 
-> 样本量小（50 题），数字只用于同一套题内的相对比较，不当绝对指标看。
+![基线 vs 优化版](docs/comparison.png)
 
-## 4. 每一步为什么有效
+| 指标（50 题） | 基线版 | 优化版 | 说明 |
+|---|---|---|---|
+| 无依据仍作答 | 8 | **0** | 目标材料没被检索到、回答里也没说「未提及」 |
+| 明确拒答 | 1 | **31** | 回答里出现「材料库中未提及」这类表述 |
+| 回答含未检索材料 | 17 | 11 | 回答提到的材料名不在当次检索片段里 |
+| 平均回答长度 | 93 字 | **31 字** | 拒答比长篇解释短得多 |
 
-| 观察到的问题 | 手段 | 为什么管用 |
-|---|---|---|
-| 「天然新疆棉和驼绒有什么区别」只召回新疆棉 | 加 BM25 关键词检索 | 专有名词走字面匹配，正好补向量检索的短板 |
-| 两路分数不可比（余弦距离 vs BM25 分） | RRF（`k=60`）只用**排名**融合 | 不需要调权重，天然抗分数尺度差异 |
-| RRF 后 Top-50 仍混着无关文档 | Cross-Encoder 联合编码精排，保留 top-5 | query 和 doc 拼一起算相似度，能判断"这段是否回答问题" |
-| Few-shot + 长上下文导致 token 暴涨 | 滑动窗口 5 轮 + 摘要压缩 | 只保留最近交互，超出的压成一句摘要 |
+这些数字全部可以用 [`docs/metrics.py`](docs/metrics.py) 从仓库里的 `results_*.json` 复算，不依赖人工判断：
 
-核心代码在 [`hybrid_retriever.py`](hybrid_retriever.py)：`bm25_search` → `vector_search` → `rrf_fusion` → `rerank`，四个函数各自独立、可单独替换。
+```bash
+python docs/metrics.py           # 打印指标
+python docs/metrics.py --chart   # 重新生成 docs/comparison.png
+```
 
-## 5. 文件结构
+### 一个具体例子
+
+问：「天然新疆棉和驼绒有什么区别」——语料里没有任何关于驼绒的说明。
+
+- 基线版：`根据你提供的材料，**无法判断天然新疆棉和驼绒的区别**，因为材料中只介绍了：- 天然新疆棉：柔软亲肤……` —— 这一题它答得不错；但同一批基线回答里，问「驼绒适合什么人」「雪绒棉有什么特点」时就直接编了。
+- 优化版：`材料库中未提及"驼绒"，无法比较。天然新疆棉的特点是柔软亲肤……` —— 先明确边界，再回答能回答的部分。
+
+## 3. 为什么会这样
+
+这批问题里有相当一部分是**语料覆盖不到的**：15 种材料只有 8 种被写进了 `data/materials.md`，而测试集照样问了雪绒棉、酷布网、mini簧、麻布袋、四叶草科技酷布、羊毛q弹棉、纯棉梭织布。
+
+- 检索层对这类问题无能为力 —— 语料里没有，召回再多也是空的。50 题里 26 题召回到了目标材料；14 个对比类问题里，只有 2 题把两个材料都召全。
+- 于是模型的默认行为就变成「编」：它知道床垫材料的常识，也很乐意补全。
+- 优化版做的事很简单：**把「没依据就说没提及」写进 Prompt，再给 3 个正例示范格式**。模型于是从"自信地编"切到"先声明边界再回答"。
+
+这也是这个实验真正的结论：**在语料覆盖不全的场景里，最便宜、最有效的幻觉治理是先让模型学会拒答，而不是先去调检索。**
+
+## 4. 文件结构
 
 | 文件 | 作用 |
 |---|---|
-| `rag_core_baseline.py` | 基线版：向量检索 + 简单 Prompt |
-| `rag_core_optimized.py` | 优化版：混合检索 + 重排 + few-shot |
-| `hybrid_retriever.py` | BM25 / 向量 / RRF / Cross-Encoder 重排 |
+| `rag_core_baseline.py` | 基线：向量检索 top-3 + 裸 Prompt |
+| `rag_core_optimized.py` | 优化：同一检索 + few-shot 与事实约束 Prompt |
+| `hybrid_retriever.py` | BM25 / 向量 / RRF 融合 / Cross-Encoder 重排 —— **本轮评测未接入** |
 | `context_manager.py` | few-shot Prompt、滑动窗口 `ConversationHistory`、摘要压缩 |
 | `fault_tolerance.py` | `retry_with_timeout` / `classify_error` / `fallback_to_mysql` |
 | `mattress_db.py` | MySQL 数据层 + ChromaDB 失败时的模糊查询兜底 |
-| `test_questions.py` | 50 个测试问题 |
-| `run_ragas.py` | 用 RAGAS 跑 Faithfulness / Answer Relevancy |
-| `data/materials.md` | 15 条材料说明（语料） |
-| `results_*.json` | 两个版本的逐题输出 |
+| `test_questions.py` | 50 个测试问题（对比 / 适用人群 / 保养 / 极值 / 场景） |
+| `run_ragas.py` | RAGAS（Faithfulness / Answer Relevancy）评测入口 |
+| `data/materials.md` | 15 种材料里被写入语料的 8 条说明 |
+| `docs/metrics.py` | 指标复算 + 对比图生成脚本 |
+| `results_*.json` | 两版逐题输出（含当次检索到的片段） |
 
-## 6. 运行
+## 5. 混合检索模块（已实现，未接入本轮评测）
 
-```bash
-python -m venv ragas-env
-# Windows: ragas-env\Scripts\activate
-source ragas-env/bin/activate
-pip install -r requirements.txt
+[`hybrid_retriever.py`](hybrid_retriever.py) 里实现了完整链路：
 
-cp .env.example .env          # 填 DEEPSEEK_API_KEY
-
-export HF_ENDPOINT=https://hf-mirror.com   # 国内下载模型加速
-python rag_core_optimized.py               # 跑 50 题，产出 results_optimized.json
-python run_ragas.py                        # 评测打分
+```
+bm25_search(top-50) ─┐
+                     ├─ rrf_fusion(k=60) ─ rerank(Cross-Encoder, top-5)
+vector_search(top-50)┘
 ```
 
-## 7. 容错设计
+设计意图是补向量检索的短板：专有名词（「驼绒」「酷布弹簧20高9环」）在向量空间里不占优势，靠 BM25 字面匹配补；两路分数不可比，RRF 只对名次融合；融合后 Top-50 仍有噪声，再用 Cross-Encoder 对「问题-文档」联合编码精排。
+
+**但它没有接进 `rag_core_optimized.py` 的检索路径**，原因很实际：跑通需要 `chromadb` + `sentence-transformers`，以及两个模型（`all-MiniLM-L6-v2`、`cross-encoder/ms-marco-MiniLM-L6-v2`）的下载。当前环境不具备，所以本轮只验证了 Prompt 这一层。
+
+要接入，改动很小 —— 把 `rag_core_optimized.py` 里的 `docs = search(...)` 换成：
+
+```python
+from hybrid_retriever import hybrid_search
+docs = hybrid_search(query, chunks, collection, model)   # 返回 top-5
+```
+
+然后重跑 50 题、重新生成 `results_optimized.json`，才能得到「检索层贡献了多少」的对照数据。**在那之前，本仓库不声称检索优化带来了多少收益。**
+
+## 6. 容错设计
 
 链路里任何一环挂掉都不应该让整条问答失败：
 
@@ -90,12 +104,28 @@ python run_ragas.py                        # 评测打分
 - `classify_error`：区分 `timeout` / `connection` / `data` 三类 —— **数据类错误不重试**（重试也不会变对）；
 - `fallback_to_mysql`：ChromaDB 检索失败时退回 MySQL 关键词模糊查，宁可降级也别整体报错。
 
+## 7. 运行
+
+```bash
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env          # 填 DEEPSEEK_API_KEY
+
+export HF_ENDPOINT=https://hf-mirror.com   # 国内下载模型加速
+python rag_core_baseline.py                # 50 题 → results_baseline.json
+python rag_core_optimized.py               # 50 题 → results_optimized.json
+python run_ragas.py                        # RAGAS 打分（需自行落盘结果）
+python docs/metrics.py --chart             # 指标 + 对比图
+```
+
+> RAGAS 的 Faithfulness 分数本轮没有随结果落盘，因此仓库里不引用任何具体分值 —— 需要的话跑 `run_ragas.py` 自己出一份。
+
 ## 8. 局限与下一步
 
-- **样本太小**：15 条语料、50 个问题，方差大；下一步扩到真实商品目录并做分桶统计（对比 / 极值 / 场景）。
-- **中文没做专门处理**：`bm25_search` 目前按字符切分（`list(c)`），中文应该换 jieba 分词；embedding 也换 `text2vec-base-chinese` 更合适。
-- **幻觉判定还是 LLM-as-judge**：可加 claim-level NLI 校验，把"哪一句编的"定位到句子级。
-- **检索与生成耦合**：可以再叠一层 self-RAG（先判断检索内容是否足够，不够就明确拒答）。
+- **只验证了 Prompt 层**：检索层的收益还是空白，这是最该补的实验（见第 5 节）。
+- **语料覆盖不全**：15 种材料只写了 8 种，一半问题天然无解；这本身值得单独讨论 —— 是补语料，还是接受"覆盖不全 + 明确拒答"作为诚实的产品行为。
+- **中文没做专门处理**：`bm25_search` 现在按字符切分（`list(c)`），中文应换 jieba 分词；embedding 也该换 `text2vec-base-chinese`。
+- **幻觉判定偏代理**：现在是「材料名是否被检索覆盖」这类字符串口径；上 claim-level NLI 才能定位到句子级。
 
 ## 9. License
 
