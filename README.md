@@ -96,3 +96,7 @@ python run_ragas.py                        # 评测打分
 - **中文没做专门处理**：`bm25_search` 目前按字符切分（`list(c)`），中文应该换 jieba 分词；embedding 也换 `text2vec-base-chinese` 更合适。
 - **幻觉判定还是 LLM-as-judge**：可加 claim-level NLI 校验，把"哪一句编的"定位到句子级。
 - **检索与生成耦合**：可以再叠一层 self-RAG（先判断检索内容是否足够，不够就明确拒答）。
+
+## 9. License
+
+[MIT](LICENSE) © 2026 Mar-alf
