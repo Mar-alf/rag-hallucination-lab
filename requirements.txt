@@ -1,0 +1,9 @@
+sentence-transformers>=2.2
+chromadb>=0.4
+rank-bm25>=0.2.2
+python-dotenv>=1.0
+openai>=1.0
+pymysql>=1.1
+# 评测（run_ragas.py）
+ragas>=0.2
+datasets>=2.18
